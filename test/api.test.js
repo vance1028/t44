@@ -176,3 +176,241 @@ test('非法 JSON 请求体返回 400', async () => {
     .send('{ bad json');
   assert.strictEqual(res.status, 400);
 });
+
+/* ---------- 账单 ---------- */
+
+test('POST /api/bills/generate 为单个学生生成账单', async () => {
+  const res = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  assert.strictEqual(res.status, 201);
+  assert.ok(res.body.data.billNo.startsWith('BILL-202606'));
+  assert.strictEqual(res.body.data.studentId, 1);
+  assert.strictEqual(res.body.data.periodYear, 2026);
+  assert.strictEqual(res.body.data.periodMonth, 6);
+  assert.strictEqual(res.body.data.version, 1);
+  assert.strictEqual(res.body.data.status, 'DRAFT');
+  assert.ok(res.body.data.chargeCents > 0);
+  assert.ok(Array.isArray(res.body.data.items));
+});
+
+test('POST /api/bills/generate 同周期同学生重复生成返回 409', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const res = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  assert.strictEqual(res.status, 409);
+});
+
+test('POST /api/bills/generate 批量生成全部学生账单', async () => {
+  const res = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  assert.strictEqual(res.status, 201);
+  assert.ok(res.body.data.created >= 2);
+});
+
+test('POST /api/bills/:id/issue 出账锁定', async () => {
+  const gen = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const billId = gen.body.data.id;
+  const res = await request(app).post(`/api/bills/${billId}/issue`);
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.data.status, 'ISSUED');
+  assert.ok(res.body.data.issuedAt);
+});
+
+test('POST /api/bills/:id/issue 已出账重复出账返回 409', async () => {
+  const gen = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const billId = gen.body.data.id;
+  await request(app).post(`/api/bills/${billId}/issue`);
+  const res = await request(app).post(`/api/bills/${billId}/issue`);
+  assert.strictEqual(res.status, 409);
+});
+
+test('POST /api/bills/:id/void 作废已出账账单', async () => {
+  const gen = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const billId = gen.body.data.id;
+  await request(app).post(`/api/bills/${billId}/issue`);
+  const res = await request(app).post(`/api/bills/${billId}/void`);
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.data.status, 'VOIDED');
+  assert.ok(res.body.data.voidedAt);
+});
+
+test('POST /api/bills/:id/void 草稿不能作废返回 409', async () => {
+  const gen = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const billId = gen.body.data.id;
+  const res = await request(app).post(`/api/bills/${billId}/void`);
+  assert.strictEqual(res.status, 409);
+});
+
+test('POST /api/bills/:id/regenerate 作废重出版本递增', async () => {
+  const gen = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const billId = gen.body.data.id;
+  await request(app).post(`/api/bills/${billId}/issue`);
+  const res = await request(app).post(`/api/bills/${billId}/regenerate`);
+  assert.strictEqual(res.status, 201);
+  assert.strictEqual(res.body.data.version, 2);
+  assert.strictEqual(res.body.data.status, 'DRAFT');
+  assert.ok(res.body.data.billNo.endsWith('-V2'));
+});
+
+test('GET /api/bills 查询账单列表', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const res = await request(app).get('/api/bills?periodYear=2026&periodMonth=6');
+  assert.strictEqual(res.status, 200);
+  assert.ok(res.body.data.length >= 2);
+});
+
+test('GET /api/bills/:id 查询单张账单含明细', async () => {
+  const gen = await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const billId = gen.body.data.id;
+  const res = await request(app).get(`/api/bills/${billId}`);
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.data.id, billId);
+  assert.ok(Array.isArray(res.body.data.items));
+  assert.ok(res.body.data.items.length > 0);
+});
+
+test('GET /api/bills/student/:studentId/period/:year/:month 查询学生月账单', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6, studentId: 1 });
+  const res = await request(app).get('/api/bills/student/1/period/2026/6');
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.data.studentId, 1);
+});
+
+test('GET /api/bills/reconciliation 对账汇总', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const list = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=DRAFT');
+  for (const b of list.body.data) {
+    await request(app).post(`/api/bills/${b.id}/issue`);
+  }
+  const res = await request(app).get('/api/bills/reconciliation?periodYear=2026&periodMonth=6');
+  assert.strictEqual(res.status, 200);
+  assert.ok(res.body.data.totalChargeCents > 0);
+  assert.ok(Array.isArray(res.body.data.planDistribution));
+  assert.ok(Array.isArray(res.body.data.arrears));
+  assert.strictEqual(res.body.data.billCount, list.body.data.length);
+});
+
+test('对账汇总合计与明细账单逐笔对得上', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const list = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=DRAFT');
+  for (const b of list.body.data) {
+    await request(app).post(`/api/bills/${b.id}/issue`);
+  }
+  const recon = await request(app).get('/api/bills/reconciliation?periodYear=2026&periodMonth=6');
+  const issued = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=ISSUED');
+  let sumCharge = 0;
+  let sumRefund = 0;
+  let sumReceived = 0;
+  for (const b of issued.body.data) {
+    sumCharge += b.chargeCents;
+    sumRefund += b.refundCents;
+    sumReceived += b.receivedCents;
+  }
+  assert.strictEqual(recon.body.data.totalChargeCents, sumCharge);
+  assert.strictEqual(recon.body.data.totalRefundCents, sumRefund);
+  assert.strictEqual(recon.body.data.totalReceivedCents, sumReceived);
+});
+
+/* ---------- 导出 ---------- */
+
+test('POST /api/exports 创建导出任务返回 202', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const list = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=DRAFT');
+  for (const b of list.body.data) {
+    await request(app).post(`/api/bills/${b.id}/issue`);
+  }
+  const res = await request(app)
+    .post('/api/exports')
+    .send({ taskType: 'BILLS', periodYear: 2026, periodMonth: 6, format: 'CSV' });
+  assert.strictEqual(res.status, 202);
+  assert.strictEqual(res.body.data.status, 'PENDING');
+  assert.strictEqual(res.body.data.taskType, 'BILLS');
+  assert.strictEqual(res.body.data.format, 'CSV');
+});
+
+test('GET /api/exports/:id 查询导出任务状态', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const list = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=DRAFT');
+  for (const b of list.body.data) {
+    await request(app).post(`/api/bills/${b.id}/issue`);
+  }
+  const create = await request(app)
+    .post('/api/exports')
+    .send({ taskType: 'BILLS', periodYear: 2026, periodMonth: 6, format: 'CSV' });
+  const taskId = create.body.data.id;
+  await new Promise((r) => setTimeout(r, 2000));
+  const res = await request(app).get(`/api/exports/${taskId}`);
+  assert.strictEqual(res.status, 200);
+  assert.ok(['COMPLETED', 'PROCESSING', 'PENDING'].includes(res.body.data.status));
+});
+
+test('GET /api/exports/:id/download 下载导出文件', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const list = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=DRAFT');
+  for (const b of list.body.data) {
+    await request(app).post(`/api/bills/${b.id}/issue`);
+  }
+  const create = await request(app)
+    .post('/api/exports')
+    .send({ taskType: 'BILLS', periodYear: 2026, periodMonth: 6, format: 'CSV' });
+  const taskId = create.body.data.id;
+  await new Promise((r) => setTimeout(r, 3000));
+  const statusRes = await request(app).get(`/api/exports/${taskId}`);
+  if (statusRes.body.data.status === 'COMPLETED') {
+    const dl = await request(app).get(`/api/exports/${taskId}/download`);
+    assert.strictEqual(dl.status, 200);
+    assert.ok(dl.headers['content-type'].includes('text/csv'));
+  }
+});
+
+test('POST /api/exports 对账表 JSON 导出', async () => {
+  await request(app)
+    .post('/api/bills/generate')
+    .send({ periodYear: 2026, periodMonth: 6 });
+  const list = await request(app).get('/api/bills?periodYear=2026&periodMonth=6&status=DRAFT');
+  for (const b of list.body.data) {
+    await request(app).post(`/api/bills/${b.id}/issue`);
+  }
+  const create = await request(app)
+    .post('/api/exports')
+    .send({ taskType: 'RECONCILIATION', periodYear: 2026, periodMonth: 6, format: 'JSON' });
+  assert.strictEqual(create.status, 202);
+  await new Promise((r) => setTimeout(r, 3000));
+  const statusRes = await request(app).get(`/api/exports/${create.body.data.id}`);
+  if (statusRes.body.data.status === 'COMPLETED') {
+    const dl = await request(app).get(`/api/exports/${create.body.data.id}/download`);
+    assert.strictEqual(dl.status, 200);
+    assert.ok(dl.headers['content-type'].includes('application/json'));
+  }
+});
